@@ -17,6 +17,7 @@ Install dependencies:
 """
 
 import json
+import time
 import torch
 from datasets import load_dataset, Dataset
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
@@ -298,6 +299,7 @@ with stage_timer("8. Save model"):
     trainer.save_model("./qwen3-fable5-sft/final")
     print("✅ Done! Model saved to ./qwen3-fable5-sft/final")
 
+print_profile_summary()
 
 # ─────────────────────────────────────────────
 # 8. Inference test
@@ -331,7 +333,103 @@ def inference_test(prompt: str, max_new_tokens: int = 512):
     print(f"Prompt: {prompt}\n\nResponse:\n{response[0]['generated_text'][-1]['content']}")
     return response
 
+# ─────────────────────────────────────────────
+# 9. Inference comparison: base vs fine-tuned
+# ─────────────────────────────────────────────
+def compare_models(
+    prompts: list[str],
+    finetuned_path: str = "./qwen3-fable5-sft/final",
+    max_new_tokens: int = 512,
+):
+    """
+    Run the same prompts on both the original base model and the LoRA fine-tuned model, 
+    and print the outputs side-by-side for easy comparison.
+
+    Workflow:
+    1. Load the base model → Generate outputs for all prompts.
+    2. Load and merge the LoRA weights → Generate outputs for all prompts.
+    3. Print the base model and fine-tuned model responses side-by-side.
+    """
+    from transformers import AutoTokenizer, pipeline, GenerationConfig
+    from peft import PeftModel
+
+    tok = AutoTokenizer.from_pretrained(
+        finetuned_path,
+        clean_up_tokenization_spaces=False,
+    )
+    gen_config = GenerationConfig(
+        max_new_tokens=max_new_tokens,
+        temperature=0.0,
+        do_sample=False,
+        pad_token_id=tok.eos_token_id,
+    )
+
+    def run_pipe(model, prompts: list[str]) -> list[str]:
+        _ = model.eval()
+        tok.padding_side = "left"
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tok
+        )
+        messages_batch = [[{"role": "user", "content": p}] for p in prompts]
+        with torch.no_grad():
+            results = pipe(messages_batch, batch_size=len(prompts), generation_config=gen_config)
+        return [r[0]["generated_text"][-1]["content"] for r in results]
+
+    # ── 1. Base model ────────────────────────────────────
+    with stage_timer("9a. Load base model"):
+        base_model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="sdpa",
+        )
+
+    with stage_timer("9b. Generate (base)"):
+        base_outputs = run_pipe(base_model, prompts)
+
+    del base_model
+    torch.cuda.empty_cache()
+
+    # ── 2. Fine-tuned model (LoRA merged) ────────────────
+    with stage_timer("9c. Load fine-tuned model (LoRA merge)"):
+        ft_base  = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="sdpa",
+        )
+        ft_model = PeftModel.from_pretrained(ft_base, finetuned_path).merge_and_unload()
+
+    with stage_timer("9d. Generate (fine-tuned)"):
+        ft_outputs = run_pipe(ft_model, prompts)
+
+    del ft_model
+    torch.cuda.empty_cache()
+
+    sep = "─" * 60
+    for i, prompt in enumerate(prompts):
+        print(f"\n{'═' * 60}")
+        print(f"PROMPT [{i+1}]: {prompt}")
+        print(f"{sep}")
+        print("▶ BASE MODEL")
+        print(base_outputs[i])
+        print(f"{sep}")
+        print("▶ FINE-TUNED (LoRA)")
+        print(ft_outputs[i])
+
+    print(f"\n{'═' * 60}")
+    return list(zip(base_outputs, ft_outputs))
+
+
 
 if __name__ == "__main__":
-    with stage_timer("9. Inference test"):
-        inference_test("Write a simple Python HTTP server with logging.")
+    prompts = [
+            "Write a simple Python HTTP server with logging.",
+            "Use a tool to search for the latest news about climate change.",
+            "Think step by step: what is 17 * 23?",
+        ]
+    
+    with stage_timer("9. Inference comparison"):
+        res = compare_models(prompts)
