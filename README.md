@@ -82,7 +82,7 @@ huggingface-cli download Glint-Research/Fable-5-traces --repo-type dataset
 ### Run
 
 ```bash
-python finetune_fable5_qwen3.py
+python -m finetune_fable5_qwen3
 ```
 
 Output adapter is saved to `./qwen3-fable5-sft/final`.
@@ -108,9 +108,49 @@ split = hf_dataset.train_test_split(train_size=0.9, test_size=0.1, seed=42)
 qwen3-fable5-sft/
 ├── checkpoint-200/        # intermediate checkpoints
 ├── checkpoint-400/
-└── final/                 # final merged adapter
+└── final/                 # LoRA adapter, not merged into the base
     ├── adapter_config.json
     ├── adapter_model.safetensors
     ├── tokenizer.json
     └── tokenizer_config.json
 ```
+
+## Separate 4-bit export and inference
+
+Export the original base and trained LoRA weights independently:
+
+```bash
+python -m model_quantization --local-files-only
+```
+
+The default output is `qwen3-fable5-sft/separate-4bit/`:
+
+- `base-4bit/`: standard Transformers/bitsandbytes NF4 base model and tokenizer.
+- `adapter-4bit/`: custom NF4 LoRA weights, complete quantization state,
+  `adapter_quantization.json`, PEFT configuration, and training tokenizer.
+
+The adapter is **4-bit on disk and restored to FP32 at runtime** by
+`model_quantization.py`. It cannot be loaded directly with
+`PeftModel.from_pretrained`; use `inference.py` or `attach_adapter` from that
+module. Quantization is lossy and can change model responses. The exporter
+reports the weight error and verifies that serialization adds no further change.
+The original `final` directory is preserved.
+Existing output directories are rejected; use a new `--output-dir` to export again.
+
+```bash
+# Default: saved base + restored adapter (no repeated base quantization)
+python -m inference --prompt "What is 17 * 23?"
+python -m inference --use-adapter --thinking --max-new-tokens 512
+
+# Same saved base, without reading any adapter files
+python -m inference --no-use-adapter --prompt "What is 17 * 23?"
+
+# Original floating-point PEFT adapter is still supported
+python -m inference --adapter-path ./qwen3-fable5-sft/final
+
+# Format validation and round-trip tests; no downloads required
+python -m unittest discover -s tests -v
+```
+
+For a custom separate output, pass its two subdirectories via
+`--base-model` and `--adapter-path`. Inference uses local/cached files only.
