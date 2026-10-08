@@ -154,3 +154,42 @@ python -m unittest discover -s tests -v
 
 For a custom separate output, pass its two subdirectories via
 `--base-model` and `--adapter-path`. Inference uses local/cached files only.
+
+## Compare logprobs before and after fine-tuning
+
+Compare **P(next token | full input)** with the adapter disabled/enabled.
+Defaults: `qwen3-fable5-sft/separate-4bit/base-4bit` and `adapter-4bit`.
+Both passes use identical input tokens, with no generation or sampling.
+
+```bash
+# Next-token distribution + per-layer hidden-state differences; save full report
+python -m compare_logprobs --text "this is a pen" --hidden-states --output result.json
+
+# Show each model's top 20 candidates (display only; metrics use the full vocabulary)
+python -m compare_logprobs --text "this is a pen" --top-k 20
+
+# Read input from a UTF-8 file
+python -m compare_logprobs --text-file input.txt --output result.json
+
+# Optional: score the supplied text itself instead of the next-token distribution
+python -m compare_logprobs --mode text --text "this is a pen"
+
+# Score a fixed answer to a chat prompt
+python -m compare_logprobs --mode text --prompt "What is 17 * 23?" --text "391."
+```
+
+Use `--base-model` / `--adapter-path` for custom models and `--device cpu` for CPU.
+`--max-tokens` defaults to 4096 including any prompt; longer inputs are rejected.
+Run `python -m compare_logprobs --help` for all options.
+
+**Reading the output:**
+
+- **Delta** = adapter enabled minus disabled. Positive logprob delta means a
+  token becomes more likely; probability deltas are in percentage points.
+- **TV / KL / JS** summarize the full distribution difference; zero means
+  identical distributions. These are not accuracy metrics.
+- **Hidden states** (`--hidden-states`): each decoder layer reports
+  `100 * mean(abs(enabled - disabled)) / mean(abs(disabled))` across all input
+  tokens and hidden dimensions. The overall value is the mean across layers.
+- **JSON** includes full vocabulary logprob arrays under `distribution`
+  (array index = token ID), top candidates, and optional hidden-state statistics.

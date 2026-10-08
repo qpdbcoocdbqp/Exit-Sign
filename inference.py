@@ -24,23 +24,13 @@ DEFAULT_ADAPTER = DEFAULT_ROOT / "adapter-4bit"
 DEFAULT_BASE = DEFAULT_ROOT / "base-4bit"
 
 
-def inference_test(
-    prompt: str,
-    max_new_tokens: int = 256,
+def load_inference_model(
     device: str = "cuda:0",
-    temperature: float = 0.0,
-    enable_thinking: bool = False,
     use_adapter: bool = True,
     adapter_path: str | Path | None = None,
     base_model: str | Path | None = None,
-) -> str:
-    """Generate with a saved 4-bit base and optional separate LoRA adapter."""
-    if not prompt.strip():
-        raise ValueError("Prompt must not be empty.")
-    if max_new_tokens < 1:
-        raise ValueError("max_new_tokens must be positive.")
-    if not math.isfinite(temperature) or temperature < 0:
-        raise ValueError("temperature must be finite and nonnegative (0 = greedy decoding).")
+):
+    """Load the shared local 4-bit base, optional adapter, and tokenizer."""
     if base_model is None:
         base_model = DEFAULT_BASE
         if not (base_model / "config.json").is_file():
@@ -51,7 +41,7 @@ def inference_test(
             raise FileNotFoundError(f"Missing adapter_config.json in {adapter_path}")
 
     import torch
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, GenerationConfig
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     target_device = torch.device(device)
     if target_device.type not in ("cuda", "cpu"):
@@ -104,6 +94,33 @@ def inference_test(
         model = attach_adapter(model, adapter_path, target_device)
     model.eval()
     print(f"Model loaded on {target_device}; footprint: {model.get_memory_footprint() / 1024**2:.1f} MiB")
+    return model, tokenizer, target_device
+
+
+def inference_test(
+    prompt: str,
+    max_new_tokens: int = 256,
+    device: str = "cuda:0",
+    temperature: float = 0.0,
+    enable_thinking: bool = False,
+    use_adapter: bool = True,
+    adapter_path: str | Path | None = None,
+    base_model: str | Path | None = None,
+) -> str:
+    """Generate with a saved 4-bit base and optional separate LoRA adapter."""
+    if not prompt.strip():
+        raise ValueError("Prompt must not be empty.")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive.")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and nonnegative (0 = greedy decoding).")
+
+    import torch
+    from transformers import GenerationConfig
+
+    model, tokenizer, target_device = load_inference_model(
+        device=device, use_adapter=use_adapter, adapter_path=adapter_path, base_model=base_model,
+    )
 
     chat = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
