@@ -1,16 +1,17 @@
-"""Compare next-token distributions with the same input, with/without LoRA.
+"""Evaluate the fine-tuned adapter against its base.
 
-python -m compare_logprobs --text "this is a pen" --hidden-states
-python -m compare_logprobs --mode text --prompt "What is 17 * 23?" --text "391."
+- compare_logprobs: next-token distributions (or fixed-text scores) with the
+  same input, adapter disabled vs enabled, plus optional hidden-state stats.
+- compare_models: generate side-by-side with the base and merged LoRA model.
 """
 
-import argparse
 from contextlib import contextmanager
 import json
 import math
 from pathlib import Path
 
-from inference import DEFAULT_ADAPTER, DEFAULT_BASE, load_inference_model
+from .inference import load_inference_model
+from .utils import DEFAULT_ADAPTER, DEFAULT_BASE, FINAL_ADAPTER, MODEL_ID, stage_timer
 
 
 def prepare_tokens(tokenizer, text, prompt=None, enable_thinking=False, mode="text"):
@@ -302,63 +303,121 @@ def print_next_token_report(report):
               f"{json.dumps(row['token'], ensure_ascii=True)}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--text", help="Fixed input context (or text to score with --mode text)")
-    source.add_argument("--text-file", type=Path, help="UTF-8 file containing fixed input text")
-    parser.add_argument("--mode", choices=("next-token", "text"), default="next-token",
-                        help="next-token (default): distribution after the full input; text: score supplied tokens")
-    parser.add_argument("--top-k", type=int, default=10, help="Display union of each model's top-k next tokens; JSON keeps full distributions")
-    parser.add_argument("--prompt", help="Optional user chat prompt preceding --text as a fixed assistant continuation")
-    parser.add_argument("--thinking", action="store_true", help="Enable thinking in the chat prefix")
-    parser.add_argument("--base-model", help=f"Unmerged local/cached base; default: {DEFAULT_BASE}")
-    parser.add_argument("--adapter-path", type=Path, help=f"PEFT or NF4 adapter; default: {DEFAULT_ADAPTER}")
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--max-tokens", type=int, default=4096, help="Reject longer inputs (including prompt); no truncation")
-    parser.add_argument("--hidden-states", action="store_true", help="Also compare each decoder layer over all input tokens")
-    parser.add_argument("--output", type=Path, help="Save full report and per-token scores as UTF-8 JSON")
-    args = parser.parse_args()
-    try:
-        text = args.text_file.read_text(encoding="utf-8") if args.text_file else args.text
-        report = compare_logprobs(
-            text, prompt=args.prompt, device=args.device, adapter_path=args.adapter_path,
-            base_model=args.base_model, enable_thinking=args.thinking, max_tokens=args.max_tokens,
-            include_hidden_states=args.hidden_states,
-            mode=args.mode, top_k=args.top_k,
-        )
-    except (ValueError, OSError) as exc:
-        parser.error(str(exc))
+def print_text_report(report):
     summary = report["summary"]
-    if args.mode == "next-token":
-        print_next_token_report(report)
-    else:
-        print(f"\nScored tokens: {summary['scored_tokens']} | delta = fine-tuned - base (nats)")
-        print(f"{'Metric':<18} {'Base':>14} {'Fine-tuned':>14} {'Delta':>14}")
-        for metric in ("total", "mean"):
-            print(f"{metric + ' logprob':<18} {summary[f'base_{metric}_logprob']:>14.6f} "
-                  f"{summary[f'finetuned_{metric}_logprob']:>14.6f} {summary[f'delta_{metric}_logprob']:>+14.6f}")
-        print("\nPosition   Token ID         Base   Fine-tuned        Delta  Token")
-        for row in report["tokens"]:
-            print(f"{row['position']:>8} {row['token_id']:>10} {row['base_logprob']:>12.6f} "
-                  f"{row['finetuned_logprob']:>12.6f} {row['delta_logprob']:>+12.6f}  "
-                  f"{json.dumps(row['token'], ensure_ascii=True)}")
-    if "hidden_states" in report:
-        hidden = report["hidden_states"]
-        print("\nHidden states: 100 * mean(abs(fine-tuned - base)) / mean(abs(base))")
-        print("All input tokens; decoder block outputs before final model norm; layers numbered from 1.")
-        print(f"{'Layer':>8} {'Base mean |h|':>16} {'Mean |delta h|':>16} {'Difference %':>16}")
-        for row in hidden["layers"]:
-            percent = row["relative_mae_percent"]
-            formatted = f"{percent:.6f}%" if percent is not None else "undefined"
-            print(f"{row['layer']:>8} {row['base_mean_absolute_activation']:>16.6f} "
-                  f"{row['mean_absolute_difference']:>16.6f} {formatted:>16}")
-        mean = hidden["mean_relative_mae_percent"]
-        print(f"Mean across layers: {mean:.6f}%" if mean is not None else "Mean across layers: undefined")
-    if args.output:
-        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-        print(f"\nSaved: {args.output}")
+    print(f"\nScored tokens: {summary['scored_tokens']} | delta = fine-tuned - base (nats)")
+    print(f"{'Metric':<18} {'Base':>14} {'Fine-tuned':>14} {'Delta':>14}")
+    for metric in ("total", "mean"):
+        print(f"{metric + ' logprob':<18} {summary[f'base_{metric}_logprob']:>14.6f} "
+              f"{summary[f'finetuned_{metric}_logprob']:>14.6f} {summary[f'delta_{metric}_logprob']:>+14.6f}")
+    print("\nPosition   Token ID         Base   Fine-tuned        Delta  Token")
+    for row in report["tokens"]:
+        print(f"{row['position']:>8} {row['token_id']:>10} {row['base_logprob']:>12.6f} "
+              f"{row['finetuned_logprob']:>12.6f} {row['delta_logprob']:>+12.6f}  "
+              f"{json.dumps(row['token'], ensure_ascii=True)}")
 
 
-if __name__ == "__main__":
-    main()
+def print_hidden_states_report(hidden):
+    print("\nHidden states: 100 * mean(abs(fine-tuned - base)) / mean(abs(base))")
+    print("All input tokens; decoder block outputs before final model norm; layers numbered from 1.")
+    print(f"{'Layer':>8} {'Base mean |h|':>16} {'Mean |delta h|':>16} {'Difference %':>16}")
+    for row in hidden["layers"]:
+        percent = row["relative_mae_percent"]
+        formatted = f"{percent:.6f}%" if percent is not None else "undefined"
+        print(f"{row['layer']:>8} {row['base_mean_absolute_activation']:>16.6f} "
+              f"{row['mean_absolute_difference']:>16.6f} {formatted:>16}")
+    mean = hidden["mean_relative_mae_percent"]
+    print(f"Mean across layers: {mean:.6f}%" if mean is not None else "Mean across layers: undefined")
+
+
+# ─────────────────────────────────────────────
+# Generation comparison: base vs fine-tuned
+# ─────────────────────────────────────────────
+def compare_models(
+    prompts: list[str],
+    finetuned_path: str | Path = FINAL_ADAPTER,
+    max_new_tokens: int = 512,
+    base_model_id: str = MODEL_ID,
+):
+    """
+    Run the same prompts on both the original base model and the LoRA fine-tuned model, 
+    and print the outputs side-by-side for easy comparison.
+
+    Workflow:
+    1. Load the base model → Generate outputs for all prompts.
+    2. Load and merge the LoRA weights → Generate outputs for all prompts.
+    3. Print the base model and fine-tuned model responses side-by-side.
+    """
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, pipeline
+
+    tok = AutoTokenizer.from_pretrained(
+        finetuned_path,
+        clean_up_tokenization_spaces=False,
+    )
+    gen_config = GenerationConfig(
+        max_new_tokens=max_new_tokens,
+        temperature=0.0,
+        do_sample=False,
+        pad_token_id=tok.eos_token_id,
+    )
+
+    def run_pipe(model, prompts: list[str]) -> list[str]:
+        _ = model.eval()
+        tok.padding_side = "left"
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tok
+        )
+        messages_batch = [[{"role": "user", "content": p}] for p in prompts]
+        with torch.no_grad():
+            results = pipe(messages_batch, batch_size=len(prompts), generation_config=gen_config)
+        return [r[0]["generated_text"][-1]["content"] for r in results]
+
+    # ── 1. Base model ────────────────────────────────────
+    with stage_timer("9a. Load base model"):
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="sdpa",
+        )
+
+    with stage_timer("9b. Generate (base)"):
+        base_outputs = run_pipe(base_model, prompts)
+
+    del base_model
+    torch.cuda.empty_cache()
+
+    # ── 2. Fine-tuned model (LoRA merged) ────────────────
+    with stage_timer("9c. Load fine-tuned model (LoRA merge)"):
+        ft_base  = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="sdpa",
+        )
+        ft_model = PeftModel.from_pretrained(ft_base, str(finetuned_path)).merge_and_unload()
+
+    with stage_timer("9d. Generate (fine-tuned)"):
+        ft_outputs = run_pipe(ft_model, prompts)
+
+    del ft_model
+    torch.cuda.empty_cache()
+
+    sep = "─" * 60
+    for i, prompt in enumerate(prompts):
+        print(f"\n{'═' * 60}")
+        print(f"PROMPT [{i+1}]: {prompt}")
+        print(f"{sep}")
+        print("▶ BASE MODEL")
+        print(base_outputs[i])
+        print(f"{sep}")
+        print("▶ FINE-TUNED (LoRA)")
+        print(ft_outputs[i])
+
+    print(f"\n{'═' * 60}")
+    return list(zip(base_outputs, ft_outputs))
+

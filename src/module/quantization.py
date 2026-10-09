@@ -1,18 +1,11 @@
 """Export the Fable-5 base and LoRA adapter separately in 4-bit NF4.
 
-Install: pip install torch transformers peft accelerate bitsandbytes
-Run:     python model_quantization.py
-Test:    python model_quantization.py --prompt "What is 17 * 23?"
-
-Input defaults to ./qwen3-fable5-sft/final (relative to this script).
-Default output: ./qwen3-fable5-sft/separate-4bit/{base-4bit,adapter-4bit}.
 Base uses standard Transformers/bitsandbytes storage. Adapter uses a custom
-NF4 format, restored to FP32 by model_quantization.attach_adapter at runtime.
+NF4 format, restored to FP32 by attach_adapter at runtime.
 Both use double quantization; base embeddings/norm/head remain floating point.
 Source files are never changed.
 """
 
-import argparse
 import gc
 import json
 import math
@@ -20,8 +13,7 @@ from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-
-DEFAULT_ADAPTER = Path(__file__).resolve().parent / "qwen3-fable5-sft" / "final"
+from .utils import FINAL_ADAPTER, SEPARATE_ROOT, resolve_device
 
 
 MANIFEST = "adapter_quantization.json"
@@ -218,26 +210,21 @@ def attach_adapter(base_model, directory, device):
     print(f"Loaded NF4 adapter: {directory} (4-bit on disk; FP32 at runtime, {len(weights)} tensors).", flush=True)
     return model
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--adapter-path", type=Path, default=DEFAULT_ADAPTER)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_ADAPTER.with_name("separate-4bit"),
-                        help="Output directory containing base-4bit and adapter-4bit.")
-    parser.add_argument("--base-model", help="Override base_model_name_or_path from adapter_config.json.")
-    parser.add_argument("--device", default="cuda:0", help="Quantization/inference device: cuda:0 or cpu.")
-    parser.add_argument("--local-files-only", action="store_true", help="Use cached/local files only.")
-    parser.add_argument("--prompt", help="Optional chat prompt to test the saved, reloaded model.")
-    parser.add_argument("--max-new-tokens", type=int, default=128)
-    args = parser.parse_args()
-    if args.max_new_tokens < 1:
-        parser.error("--max-new-tokens must be positive")
-    return args
 
-
-def quantize_model(args):
-    adapter_path = args.adapter_path.expanduser().resolve()
-    output_dir = args.output_dir.expanduser().resolve()
+def quantize_model(
+    adapter_path: str | Path = FINAL_ADAPTER,
+    output_dir: str | Path = SEPARATE_ROOT,
+    base_model: str | None = None,
+    device: str = "cuda:0",
+    local_files_only: bool = False,
+    prompt: str | None = None,
+    max_new_tokens: int = 128,
+):
+    """Export base-4bit and adapter-4bit under output_dir; return output_dir."""
+    adapter_path = Path(adapter_path).expanduser().resolve()
+    output_dir = Path(output_dir).expanduser().resolve()
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive.")
     if not (adapter_path / "adapter_config.json").is_file():
         raise FileNotFoundError(f"Missing adapter_config.json in {adapter_path}")
     if not any((adapter_path / name).is_file() for name in
@@ -246,33 +233,23 @@ def quantize_model(args):
     if output_dir == adapter_path or output_dir in adapter_path.parents or adapter_path in output_dir.parents:
         raise ValueError("Output and adapter directories must not overlap.")
     if output_dir.exists():
-        raise FileExistsError(f"Output already exists: {output_dir}. Choose a new --output-dir.")
+        raise FileExistsError(f"Output already exists: {output_dir}. Choose a new output directory.")
 
-    # Do not import finetune_fable5_qwen3: importing it would start training.
     import torch
     from bitsandbytes.nn import Linear4bit
     from peft import PeftConfig
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    device = torch.device(args.device)
-    if device.type not in ("cpu", "cuda"):
-        raise ValueError("--device must be cpu or a CUDA device such as cuda:0")
-    if device.type == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is unavailable. Install CUDA-enabled PyTorch or use --device cpu.")
-        torch.cuda.set_device(device)
-        compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    else:
-        compute_dtype = torch.float32
+    device, compute_dtype = resolve_device(device)
 
     peft_config = PeftConfig.from_pretrained(str(adapter_path), local_files_only=True)
     if peft_config.peft_type != "LORA":
-        raise ValueError("This exporter expects the LoRA adapter produced by finetune_fable5_qwen3.py.")
-    base_model_id = args.base_model or peft_config.base_model_name_or_path
+        raise ValueError("This exporter expects the LoRA adapter produced by src.train.")
+    base_model_id = base_model or peft_config.base_model_name_or_path
     if not base_model_id:
         raise ValueError("Adapter has no base model ID; specify --base-model.")
-    base_kwargs = {"local_files_only": args.local_files_only}
-    if peft_config.revision and not args.base_model:
+    base_kwargs = {"local_files_only": local_files_only}
+    if peft_config.revision and not base_model:
         base_kwargs["revision"] = peft_config.revision
     base_config = AutoConfig.from_pretrained(base_model_id, **base_kwargs)
     if getattr(base_config, "quantization_config", None):
@@ -346,18 +323,18 @@ def quantize_model(args):
             raise RuntimeError("Saved base model unexpectedly contains LoRA parameters.")
         print(f"Verified {len(quantized_layers)} NF4 linear layers.", flush=True)
         model = attach_adapter(model, export_dir / "adapter-4bit", device).eval()
-        if args.prompt:
+        if prompt:
             tokenizer = AutoTokenizer.from_pretrained(
                 export_dir / "adapter-4bit", local_files_only=True,
             )
             text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": args.prompt}],
+                [{"role": "user", "content": prompt}],
                 tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
             inputs = tokenizer(text, add_special_tokens=False, return_tensors="pt").to(device)
             from transformers import GenerationConfig
             model.generation_config = GenerationConfig(
-                max_new_tokens=args.max_new_tokens, do_sample=False,
+                max_new_tokens=max_new_tokens, do_sample=False,
                 eos_token_id=model.generation_config.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
             )
@@ -373,7 +350,3 @@ def quantize_model(args):
     size_mb = sum(path.stat().st_size for path in output_dir.rglob("*") if path.is_file()) / 1024**2
     print(f"Done: {output_dir} ({size_mb:.1f} MiB)")
     return output_dir
-
-
-if __name__ == "__main__":
-    quantize_model(parse_args())

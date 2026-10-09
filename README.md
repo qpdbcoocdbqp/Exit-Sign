@@ -57,7 +57,24 @@ huggingface-cli download Glint-Research/Fable-5-traces --repo-type dataset
 
 ---
 
-## Fine-tuning: `finetune_fable5_qwen3.py`
+## Project layout
+
+```
+src/
+├── train.py, inference.py, quantization.py, evaluate.py   # CLI scripts (python -m src.<name>)
+└── module/
+    ├── utils.py          # shared paths, stage timer, device helper
+    ├── train.py          # dataset pairs, LoRA/SFT config, training
+    ├── inference.py      # load 4-bit base + adapter, generate
+    ├── quantization.py   # NF4 base/adapter export and loading
+    └── evaluate.py       # logprob comparison, base vs fine-tuned generation
+```
+
+Run every command from the repository root.
+
+---
+
+## Fine-tuning: `src/train.py`
 
 ### What the script does
 
@@ -71,7 +88,6 @@ huggingface-cli download Glint-Research/Fable-5-traces --repo-type dataset
 | **6. SFTConfig** | Configures training: cosine LR schedule, `paged_adamw_8bit`, `bf16`, `assistant_only_loss=True` to mask prompt tokens from the loss |
 | **7. Train** | Runs `SFTTrainer.train()` — chat template application and tokenisation are handled automatically |
 | **8. Save** | Saves the LoRA adapter to `./qwen3-fable5-sft/final` |
-| **9. Inference** | Merges the adapter into the base model and runs a smoke-test generation |
 
 ### Key design choices
 
@@ -82,22 +98,24 @@ huggingface-cli download Glint-Research/Fable-5-traces --repo-type dataset
 ### Run
 
 ```bash
-python -m finetune_fable5_qwen3
+python -m src.train
 ```
 
 Output adapter is saved to `./qwen3-fable5-sft/final`.
 
 ### Dry-run vs full training
 
-The script defaults to 1% of data for a quick smoke-test.
-For full training, change the split in the script:
+The script defaults to 10% train / 10% eval for a quick smoke-test.
+For full training, pass the split sizes:
 
-```python
-# dry-run (default)
-split = hf_dataset.train_test_split(train_size=0.01, test_size=0.01, seed=42)
+```bash
+python -m src.train --train-size 0.9 --test-size 0.1
+```
 
-# full training
-split = hf_dataset.train_test_split(train_size=0.9, test_size=0.1, seed=42)
+To compare the base and fine-tuned model side by side after training:
+
+```bash
+python -m src.evaluate generation
 ```
 
 ---
@@ -120,7 +138,7 @@ qwen3-fable5-sft/
 Export the original base and trained LoRA weights independently:
 
 ```bash
-python -m model_quantization --local-files-only
+python -m src.quantization --local-files-only
 ```
 
 The default output is `qwen3-fable5-sft/separate-4bit/`:
@@ -130,8 +148,8 @@ The default output is `qwen3-fable5-sft/separate-4bit/`:
   `adapter_quantization.json`, PEFT configuration, and training tokenizer.
 
 The adapter is **4-bit on disk and restored to FP32 at runtime** by
-`model_quantization.py`. It cannot be loaded directly with
-`PeftModel.from_pretrained`; use `inference.py` or `attach_adapter` from that
+`src.module.quantization`. It cannot be loaded directly with
+`PeftModel.from_pretrained`; use `src.inference` or `attach_adapter` from that
 module. Quantization is lossy and can change model responses. The exporter
 reports the weight error and verifies that serialization adds no further change.
 The original `final` directory is preserved.
@@ -139,14 +157,14 @@ Existing output directories are rejected; use a new `--output-dir` to export aga
 
 ```bash
 # Default: saved base + restored adapter (no repeated base quantization)
-python -m inference --prompt "What is 17 * 23?"
-python -m inference --use-adapter --thinking --max-new-tokens 512
+python -m src.inference --prompt "What is 17 * 23?"
+python -m src.inference --use-adapter --thinking --max-new-tokens 512
 
 # Same saved base, without reading any adapter files
-python -m inference --no-use-adapter --prompt "What is 17 * 23?"
+python -m src.inference --no-use-adapter --prompt "What is 17 * 23?"
 
 # Original floating-point PEFT adapter is still supported
-python -m inference --adapter-path ./qwen3-fable5-sft/final
+python -m src.inference --adapter-path ./qwen3-fable5-sft/final
 
 # Format validation and round-trip tests; no downloads required
 python -m unittest discover -s tests -v
@@ -163,24 +181,24 @@ Both passes use identical input tokens, with no generation or sampling.
 
 ```bash
 # Next-token distribution + per-layer hidden-state differences; save full report
-python -m compare_logprobs --text "this is a pen" --hidden-states --output result.json
+python -m src.evaluate logprobs --text "this is a pen" --hidden-states --output result.json
 
 # Show each model's top 20 candidates (display only; metrics use the full vocabulary)
-python -m compare_logprobs --text "this is a pen" --top-k 20
+python -m src.evaluate logprobs --text "this is a pen" --top-k 20
 
 # Read input from a UTF-8 file
-python -m compare_logprobs --text-file input.txt --output result.json
+python -m src.evaluate logprobs --text-file input.txt --output result.json
 
 # Optional: score the supplied text itself instead of the next-token distribution
-python -m compare_logprobs --mode text --text "this is a pen"
+python -m src.evaluate logprobs --mode text --text "this is a pen"
 
 # Score a fixed answer to a chat prompt
-python -m compare_logprobs --mode text --prompt "What is 17 * 23?" --text "391."
+python -m src.evaluate logprobs --mode text --prompt "What is 17 * 23?" --text "391."
 ```
 
 Use `--base-model` / `--adapter-path` for custom models and `--device cpu` for CPU.
 `--max-tokens` defaults to 4096 including any prompt; longer inputs are rejected.
-Run `python -m compare_logprobs --help` for all options.
+Run `python -m src.evaluate logprobs --help` for all options.
 
 **Reading the output:**
 

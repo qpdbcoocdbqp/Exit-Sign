@@ -13,9 +13,8 @@ from peft import get_peft_model_state_dict
 from safetensors.torch import load_file, save_file
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
-from model_quantization import MANIFEST, WEIGHTS, attach_adapter
-from model_quantization import export_quantized_adapter, load_quantized_adapter_state, quantize_model
-from argparse import Namespace
+from src.module.quantization import MANIFEST, WEIGHTS, attach_adapter
+from src.module.quantization import export_quantized_adapter, load_quantized_adapter_state, quantize_model
 
 
 class AdapterQuantizationTests(unittest.TestCase):
@@ -113,7 +112,7 @@ class AdapterQuantizationTests(unittest.TestCase):
         marker = self.output / "keep.txt"
         marker.write_text("keep", encoding="utf-8")
         with self.assertRaises(FileExistsError):
-            quantize_model(Namespace(adapter_path=self.source, output_dir=self.output))
+            quantize_model(adapter_path=self.source, output_dir=self.output)
         self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
 
 if __name__ == "__main__":
