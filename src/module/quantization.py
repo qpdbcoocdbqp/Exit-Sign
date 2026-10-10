@@ -217,14 +217,10 @@ def quantize_model(
     base_model: str | None = None,
     device: str = "cuda:0",
     local_files_only: bool = False,
-    prompt: str | None = None,
-    max_new_tokens: int = 128,
 ):
     """Export base-4bit and adapter-4bit under output_dir; return output_dir."""
     adapter_path = Path(adapter_path).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
-    if max_new_tokens < 1:
-        raise ValueError("max_new_tokens must be positive.")
     if not (adapter_path / "adapter_config.json").is_file():
         raise FileNotFoundError(f"Missing adapter_config.json in {adapter_path}")
     if not any((adapter_path / name).is_file() for name in
@@ -322,25 +318,7 @@ def quantize_model(
         if any("lora_" in name for name, _ in model.named_parameters()):
             raise RuntimeError("Saved base model unexpectedly contains LoRA parameters.")
         print(f"Verified {len(quantized_layers)} NF4 linear layers.", flush=True)
-        model = attach_adapter(model, export_dir / "adapter-4bit", device).eval()
-        if prompt:
-            tokenizer = AutoTokenizer.from_pretrained(
-                export_dir / "adapter-4bit", local_files_only=True,
-            )
-            text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=False, add_generation_prompt=True, enable_thinking=False,
-            )
-            inputs = tokenizer(text, add_special_tokens=False, return_tensors="pt").to(device)
-            from transformers import GenerationConfig
-            model.generation_config = GenerationConfig(
-                max_new_tokens=max_new_tokens, do_sample=False,
-                eos_token_id=model.generation_config.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-            )
-            with torch.inference_mode():
-                generated = model.generate(**inputs)
-            print(tokenizer.decode(generated[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))
+        attach_adapter(model, export_dir / "adapter-4bit", device)
         del quantized_layers, model
         gc.collect()
         if device.type == "cuda":

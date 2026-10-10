@@ -17,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument("--dataset-id", default=DATASET_ID)
+    parser.add_argument("--data-dir", type=Path, help="Local Fable-5-traces folder (traces, snapshot, or hub cache folder); default: DATASET_PATH from .env, then the Hugging Face cache")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_ROOT, help="Checkpoint directory")
     parser.add_argument("--final-dir", type=Path, default=FINAL_ADAPTER, help="Where the final adapter is saved")
     parser.add_argument("--train-size", type=float, default=0.1)
@@ -24,7 +25,7 @@ def main():
     parser.add_argument("--max-length", type=int, default=MAX_LEN)
     args = parser.parse_args()
     train(
-        model_id=args.model_id, dataset_id=args.dataset_id,
+        model_id=args.model_id, dataset_id=args.dataset_id, data_dir=args.data_dir,
         output_dir=args.output_dir, final_dir=args.final_dir,
         train_size=args.train_size, test_size=args.test_size, max_length=args.max_length,
     )

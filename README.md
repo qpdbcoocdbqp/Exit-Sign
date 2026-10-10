@@ -47,6 +47,26 @@ uv pip install transformers datasets trl peft accelerate bitsandbytes
 
 ---
 
+### Running in WSL (Linux)
+
+Training needs Triton: TRL's SFT loss uses a Triton kernel, which PyTorch ships on Linux but not on native Windows
+(on Windows it stops with `'NoneType' object has no attribute 'apply'`). Run training in WSL2 with an NVIDIA GPU;
+the Windows NVIDIA driver provides the GPU, so no Linux driver is needed.
+
+```bash
+# In WSL, from the repository (e.g. /mnt/c/Users/siao/iloveit/Exit-Sign)
+python3 -m venv ~/.venvs/exit-sign && source ~/.venvs/exit-sign/bin/activate
+pip install torch==2.12.1 torchvision --index-url https://download.pytorch.org/whl/cu130
+pip install transformers datasets trl peft accelerate bitsandbytes
+python -m src.train --train-size 0.1 --test-size 0.1
+```
+
+- Create a new venv in WSL; the Windows `.venv` does not work there.
+- Windows paths in `.env` or `--data-dir` (for example `C:\Users\...`) are mapped to `/mnt/c/...` automatically.
+- Files under `/mnt/c` are slower than the WSL home folder; copy the repository to `~/` for faster checkpoint I/O.
+
+---
+
 ## Dataset
 
 Download the dataset locally before training to avoid repeated network fetches:
@@ -98,8 +118,14 @@ Run every command from the repository root.
 ### Run
 
 ```bash
-python -m src.train
+python -m src.train --train-size 0.1 --test-size 0.1
+
 ```
+
+The dataset is read from local files, with no `datasets` cache or `teich` needed. Point it at the
+downloaded folder with `--data-dir`, or set `DATASET_PATH` in `.env` (the traces folder, a snapshot, or the
+`datasets--Glint-Research--Fable-5-traces` hub folder all work). Without either, it uses the Hugging Face cache.
+
 
 Output adapter is saved to `./qwen3-fable5-sft/final`.
 
